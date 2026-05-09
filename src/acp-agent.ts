@@ -748,6 +748,12 @@ export class ClaudeAcpAgent implements Agent {
     session.promptRunning = true;
     let handedOff = false;
     let stopReason: StopReason = "end_turn";
+    // Without `sawResult`, the prompt loop returns end_turn the moment the
+    // SDK emits `session_state_changed → idle`, even if the model hasn't
+    // emitted its terminal `result` message yet — silently truncating long
+    // turns. Hold end_turn until at least one `result` has been observed.
+    // See gateroom #339 for the trace.
+    let sawResult = false;
 
     try {
       while (true) {
@@ -756,6 +762,9 @@ export class ClaudeAcpAgent implements Agent {
         if (done || !message) {
           if (session.cancelled) {
             return { stopReason: "cancelled" };
+          }
+          if (sawResult) {
+            return { stopReason, usage: sessionUsage(session) };
           }
           break;
         }
@@ -829,7 +838,10 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               }
               case "session_state_changed": {
-                if (message.state === "idle") {
+                // Gate end_turn on `sawResult` so an idle event before the
+                // SDK has emitted its terminal `result` doesn't truncate the
+                // turn (see gateroom #339).
+                if (message.state === "idle" && sawResult) {
                   return { stopReason, usage: sessionUsage(session) };
                 }
                 break;
@@ -954,6 +966,7 @@ export class ClaudeAcpAgent implements Agent {
                 unreachable(message, this.logger);
                 break;
             }
+            sawResult = true;
             break;
           }
           case "stream_event": {
