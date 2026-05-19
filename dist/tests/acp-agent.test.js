@@ -1512,6 +1512,198 @@ describe("stop reason propagation", () => {
         expect(err).not.toBeNull();
         expect(err.data).toBeUndefined();
     });
+    // Gateroom #339 follow-up: the SDK can transit through `idle` while
+    // Monitor/Agent tasks are still running in the background (its in-process
+    // queue is empty but the work isn't done). Returning end_turn there tears
+    // down the host's session/update consumer; subsequent autonomous turns
+    // then drop on the floor. These tests pin the "hold open while tasks
+    // outstanding" gate.
+    function taskStarted(taskId, skipTranscript = false) {
+        return {
+            type: "system",
+            subtype: "task_started",
+            task_id: taskId,
+            description: `task ${taskId}`,
+            skip_transcript: skipTranscript || undefined,
+            uuid: randomUUID(),
+            session_id: "test-session",
+        };
+    }
+    function taskNotification(taskId, status = "completed") {
+        return {
+            type: "system",
+            subtype: "task_notification",
+            task_id: taskId,
+            status,
+            output_file: `/tmp/${taskId}.out`,
+            summary: `task ${taskId} ${status}`,
+            uuid: randomUUID(),
+            session_id: "test-session",
+        };
+    }
+    function taskUpdated(taskId, status) {
+        return {
+            type: "system",
+            subtype: "task_updated",
+            task_id: taskId,
+            patch: { status },
+            uuid: randomUUID(),
+            session_id: "test-session",
+        };
+    }
+    function idle() {
+        return {
+            type: "system",
+            subtype: "session_state_changed",
+            state: "idle",
+        };
+    }
+    it("holds end_turn through transient idle while a task is in flight", async () => {
+        const agent = createMockAgent();
+        // First result's usage is small (so we can verify the second one was
+        // consumed too — i.e., the loop didn't bail at the first idle).
+        const firstResult = createResultMessage({
+            subtype: "success",
+            stop_reason: null,
+            is_error: false,
+        });
+        firstResult.usage.input_tokens = 7;
+        const secondResult = createResultMessage({
+            subtype: "success",
+            stop_reason: null,
+            is_error: false,
+        });
+        secondResult.usage.input_tokens = 13;
+        injectSession(agent, [
+            taskStarted("T1"),
+            firstResult,
+            idle(), // ← bug case: would return here without the fix
+            taskNotification("T1"),
+            secondResult,
+            idle(), // ← correct return point
+        ]);
+        const response = await agent.prompt({
+            sessionId: "test-session",
+            prompt: [{ type: "text", text: "test" }],
+        });
+        expect(response.stopReason).toBe("end_turn");
+        // Both results were consumed → the loop iterated past the first idle.
+        expect(response.usage?.inputTokens).toBe(7 + 13);
+    });
+    it("waits for all outstanding tasks before returning on idle", async () => {
+        const agent = createMockAgent();
+        const firstResult = createResultMessage({
+            subtype: "success",
+            stop_reason: null,
+            is_error: false,
+        });
+        firstResult.usage.input_tokens = 5;
+        const secondResult = createResultMessage({
+            subtype: "success",
+            stop_reason: null,
+            is_error: false,
+        });
+        secondResult.usage.input_tokens = 11;
+        injectSession(agent, [
+            taskStarted("T1"),
+            taskStarted("T2"),
+            firstResult,
+            taskNotification("T1"),
+            idle(), // ← T2 still in flight; must not return
+            taskNotification("T2"),
+            secondResult,
+            idle(), // ← all tasks done; return here
+        ]);
+        const response = await agent.prompt({
+            sessionId: "test-session",
+            prompt: [{ type: "text", text: "test" }],
+        });
+        expect(response.stopReason).toBe("end_turn");
+        expect(response.usage?.inputTokens).toBe(5 + 11);
+    });
+    it("treats task_updated with terminal status as task completion", async () => {
+        const agent = createMockAgent();
+        const firstResult = createResultMessage({
+            subtype: "success",
+            stop_reason: null,
+            is_error: false,
+        });
+        firstResult.usage.input_tokens = 3;
+        const secondResult = createResultMessage({
+            subtype: "success",
+            stop_reason: null,
+            is_error: false,
+        });
+        secondResult.usage.input_tokens = 17;
+        injectSession(agent, [
+            taskStarted("T1"),
+            firstResult,
+            taskUpdated("T1", "running"), // non-terminal; still in flight
+            idle(), // ← must not return
+            taskUpdated("T1", "completed"), // terminal; now clear
+            secondResult,
+            idle(), // ← return here
+        ]);
+        const response = await agent.prompt({
+            sessionId: "test-session",
+            prompt: [{ type: "text", text: "test" }],
+        });
+        expect(response.stopReason).toBe("end_turn");
+        expect(response.usage?.inputTokens).toBe(3 + 17);
+    });
+    it("ignores skip_transcript task_started so housekeeping tasks don't pin the loop open", async () => {
+        const agent = createMockAgent();
+        const result = createResultMessage({
+            subtype: "success",
+            stop_reason: null,
+            is_error: false,
+        });
+        result.usage.input_tokens = 9;
+        injectSession(agent, [
+            taskStarted("ambient-1", true), // ambient/housekeeping
+            result,
+            idle(), // ← ambient task is invisible to the gate; return immediately
+        ]);
+        const response = await agent.prompt({
+            sessionId: "test-session",
+            prompt: [{ type: "text", text: "test" }],
+        });
+        expect(response.stopReason).toBe("end_turn");
+        expect(response.usage?.inputTokens).toBe(9);
+    });
+    it("doesn't decrement on task_notification for a task it never saw start", async () => {
+        // Stale task_notification (e.g. for an Agent run_in_background launched
+        // by a prior prompt) shouldn't push outstandingTaskIds.size negative or
+        // mask a real outstanding task.
+        const agent = createMockAgent();
+        const firstResult = createResultMessage({
+            subtype: "success",
+            stop_reason: null,
+            is_error: false,
+        });
+        firstResult.usage.input_tokens = 1;
+        const secondResult = createResultMessage({
+            subtype: "success",
+            stop_reason: null,
+            is_error: false,
+        });
+        secondResult.usage.input_tokens = 19;
+        injectSession(agent, [
+            taskStarted("REAL"),
+            taskNotification("STALE-FROM-PRIOR-PROMPT"), // no-op
+            firstResult,
+            idle(), // ← REAL still in flight; must not return
+            taskNotification("REAL"),
+            secondResult,
+            idle(), // ← return here
+        ]);
+        const response = await agent.prompt({
+            sessionId: "test-session",
+            prompt: [{ type: "text", text: "test" }],
+        });
+        expect(response.stopReason).toBe("end_turn");
+        expect(response.usage?.inputTokens).toBe(1 + 19);
+    });
 });
 describe("session/close", () => {
     function createMockAgent() {
