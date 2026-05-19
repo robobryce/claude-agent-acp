@@ -754,6 +754,16 @@ export class ClaudeAcpAgent implements Agent {
     // turns. Hold end_turn until at least one `result` has been observed.
     // See gateroom #339 for the trace.
     let sawResult = false;
+    // SDK tasks (Monitor / Agent run_in_background / etc.) the model has
+    // started but not yet finished. For long-running skills like
+    // /autocuda:optimize-tree the SDK transitions to `idle` while waiting on
+    // these — its in-process queue is empty, but the work isn't done. If we
+    // return end_turn there, the ACP host tears down the session/update
+    // handler (runtime-AKW_wQY6.js:4312 in openclaw), and every subsequent
+    // task-notification turn the SDK runs autonomously drops on the floor.
+    // Gate end_turn on this set being empty too. See gateroom #339 follow-up.
+    const outstandingTaskIds = new Set<string>();
+    const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "killed"]);
 
     try {
       while (true) {
@@ -763,6 +773,10 @@ export class ClaudeAcpAgent implements Agent {
           if (session.cancelled) {
             return { stopReason: "cancelled" };
           }
+          // If the SDK has closed the stream, we can't wait for outstanding
+          // tasks to finish — there's no further event source. Match the
+          // pre-existing `sawResult` gate and return whatever the last
+          // observed stop reason was.
           if (sawResult) {
             return { stopReason, usage: sessionUsage(session) };
           }
@@ -840,9 +854,39 @@ export class ClaudeAcpAgent implements Agent {
               case "session_state_changed": {
                 // Gate end_turn on `sawResult` so an idle event before the
                 // SDK has emitted its terminal `result` doesn't truncate the
-                // turn (see gateroom #339).
-                if (message.state === "idle" && sawResult) {
+                // turn (see gateroom #339). Also gate on
+                // `outstandingTaskIds.size === 0` so a transient idle while
+                // background Monitor/Agent tasks are still running doesn't
+                // tear down the host's session/update consumer.
+                if (message.state === "idle" && sawResult && outstandingTaskIds.size === 0) {
                   return { stopReason, usage: sessionUsage(session) };
+                }
+                break;
+              }
+              case "task_started": {
+                // Ambient/housekeeping tasks (skip_transcript) are SDK-internal
+                // and don't represent user-visible work, so they don't gate
+                // end_turn — otherwise a long-running housekeeping task would
+                // pin the prompt loop open forever.
+                if (!message.skip_transcript) {
+                  outstandingTaskIds.add(message.task_id);
+                }
+                break;
+              }
+              case "task_notification": {
+                // Terminal event for the task (completed / failed / stopped).
+                // Stop tracking it regardless of which terminal status —
+                // none of them mean "still in flight".
+                outstandingTaskIds.delete(message.task_id);
+                break;
+              }
+              case "task_updated": {
+                // task_updated is a patch; only stop tracking when the patch
+                // carries a terminal status. Intermediate transitions
+                // (pending → running) leave the task in-flight.
+                const status = message.patch?.status;
+                if (status && TERMINAL_TASK_STATUSES.has(status)) {
+                  outstandingTaskIds.delete(message.task_id);
                 }
                 break;
               }
@@ -850,10 +894,7 @@ export class ClaudeAcpAgent implements Agent {
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
-              case "task_started":
-              case "task_notification":
               case "task_progress":
-              case "task_updated":
               case "elicitation_complete":
               case "plugin_install":
               case "memory_recall":
