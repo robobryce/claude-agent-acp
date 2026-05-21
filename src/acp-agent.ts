@@ -1134,6 +1134,29 @@ export class ClaudeAcpAgent implements Agent {
               message.message.content.includes("<local-command-stderr>")
             ) {
               this.logger.error(message.message.content);
+              // gateroom#406 — local slash commands that the Claude
+              // SDK can't find produce stderr like
+              // ``Unknown command: /foo`` but were previously only
+              // logged (the operator saw a black hole in the session
+              // channel). Surface the stderr body to the client as an
+              // agent message so the operator gets a visible reply
+              // when they type an unknown slash. Strip the tag
+              // wrappers to keep the post readable.
+              const stderrBody = message.message.content
+                .replace(/<\/?local-command-stderr>/g, "")
+                .trim();
+              if (stderrBody.length > 0) {
+                await this.client.sessionUpdate({
+                  sessionId: params.sessionId,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: {
+                      type: "text",
+                      text: `⚠️ ${stderrBody}`,
+                    },
+                  },
+                });
+              }
               break;
             }
             // Skip these user messages for now, since they seem to just be messages we don't want in the feed
