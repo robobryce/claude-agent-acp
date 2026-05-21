@@ -471,6 +471,15 @@ export class ClaudeAcpAgent implements Agent {
   };
   client: AgentSideConnection;
   toolUseCache: ToolUseCache;
+  // Set of assistant-message IDs observed via a `message_start` stream
+  // event during this agent's lifetime (issue brycelelbach-private/
+  // gateroom#411). When the final `assistant` message arrives, this is
+  // the gate that decides whether to filter ``text`` / ``thinking``
+  // blocks (they're filtered only when we *saw* the streaming
+  // counterpart) — synthetic assistant messages from slash commands
+  // like `/compact` are not pre-streamed and the previous unconditional
+  // filter silently dropped their text/thinking content.
+  streamedAssistantMessageIds: Set<string>;
   backgroundTerminals: { [key: string]: BackgroundTerminal } = {};
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
@@ -480,6 +489,7 @@ export class ClaudeAcpAgent implements Agent {
     this.sessions = {};
     this.client = client;
     this.toolUseCache = {};
+    this.streamedAssistantMessageIds = new Set();
     this.logger = logger ?? console;
   }
 
@@ -1017,6 +1027,15 @@ export class ClaudeAcpAgent implements Agent {
             ) {
               if (message.event.type === "message_start") {
                 lastAssistantUsage = snapshotFromUsage(message.event.message.usage);
+                // Record this message id so the final-assistant filter
+                // below knows the text/thinking blocks were already
+                // streamed (gateroom#411). Synthetic messages from
+                // slash commands (`/compact`) don't fire
+                // ``message_start`` so they stay out of this set and
+                // their text/thinking content survives the filter.
+                if (message.event.message.id) {
+                  this.streamedAssistantMessageIds.add(message.event.message.id);
+                }
                 const model = message.event.message.model;
                 if (model && model !== "<synthetic>") {
                   lastAssistantModel = model;
@@ -1181,8 +1200,26 @@ export class ClaudeAcpAgent implements Agent {
               throw RequestError.authRequired();
             }
 
+            // gateroom#411 — only filter text/thinking blocks when the
+            // streamed counterpart has already been delivered (we saw
+            // a ``message_start`` for this message id). Synthetic
+            // assistant messages — e.g. from slash commands like
+            // `/compact` — bypass the streaming path entirely; their
+            // text/thinking content used to be silently dropped by the
+            // unconditional filter, so we now preserve those blocks.
+            const wasStreamed =
+              message.type === "assistant" &&
+              message.message.id !== undefined &&
+              this.streamedAssistantMessageIds.has(message.message.id);
+            if (message.type === "assistant" && !wasStreamed) {
+              this.logger.log(
+                `Session ${params.sessionId}: assistant message ${
+                  message.message.id ?? "<no-id>"
+                } not seen via stream events; passing text/thinking blocks through.`,
+              );
+            }
             const content =
-              message.type === "assistant"
+              wasStreamed
                 ? // Handled by stream events above
                   message.message.content.filter(
                     (item) => !["text", "thinking"].includes(item.type),
