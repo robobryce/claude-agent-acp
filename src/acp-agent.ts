@@ -2911,9 +2911,32 @@ function commonPrefixLength(a: string, b: string) {
  *  until a `result` message arrives with the authoritative `modelUsage` value.
  *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
  *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
- *  matching things like "10m" or embedded substrings. */
+ *  matching things like "10m" or embedded substrings.
+ *
+ *  gateroom#446 — ``claude-opus-4-7`` carries a 1M context window
+ *  unconditionally (the SDK's own ``mW`` resolver returns 1_000_000
+ *  for it via ``fSH``), but the model ID has no ``1m`` token so the
+ *  prior regex-only check returned ``null`` and the session fell
+ *  back to ``DEFAULT_CONTEXT_WINDOW`` (200000) on initial set. The
+ *  upgrade to 1M only happened later via top-level
+ *  ``message_start`` events; sessions whose main loop fans out to
+ *  Task subagents (whose ``message_start`` carries
+ *  ``parent_tool_use_id !== null`` and is skipped) never got the
+ *  upgrade and ``usage_update`` reported ``used > size`` (e.g.
+ *  ``231510/200000``). Match the SDK's own table for the known
+ *  unconditional-1M models so the initial value is right. */
+const UNCONDITIONAL_1M_MODELS: ReadonlySet<string> = new Set([
+  "claude-opus-4-7",
+]);
+
 function inferContextWindowFromModel(model: string): number | null {
   if (/\b1m\b/i.test(model)) return 1_000_000;
+  // Strip provider prefix (``aws/anthropic/bedrock-claude-opus-4-7``,
+  // ``anthropic/claude-opus-4-7``, etc.) and any trailing version
+  // tag the gateway might splice on before matching the model name.
+  const bare = model.split("/").pop() ?? model;
+  const stripped = bare.replace(/^bedrock-/, "").replace(/-v\d+$/, "");
+  if (UNCONDITIONAL_1M_MODELS.has(stripped)) return 1_000_000;
   return null;
 }
 
